@@ -8,16 +8,19 @@ from sklearn.cluster._kmeans import k_means
 from sklearn.metrics.pairwise import cosine_similarity
 
 import fastcluster
-from scipy.cluster.hierarchy import fcluster
-from scipy.spatial.distance import squareform
-
 try:
     import umap, hdbscan
 except ImportError:
     raise ImportError(
         "Package \"umap\" or \"hdbscan\" not found. \
         Please install them first by \"pip install umap-learn hdbscan\"."
-        )
+    )
+
+from math import floor
+from scipy.cluster.hierarchy import fcluster
+from scipy.spatial.distance import squareform
+
+from speakerlab.utils.cluster_utils import sample_embeddings_labels, reassign_labels
 
 
 class SpectralCluster:
@@ -196,11 +199,13 @@ class CommonClustering:
     """Perfom clustering for input embeddings and output the labels.
     """
 
-    def __init__(self, cluster_type, cluster_line=10, mer_cos=None, min_cluster_size=4, **kwargs):
+    def __init__(self, cluster_type, cluster_line=10, mer_cos=None, min_cluster_size=4, chunk_len=4000, min_chunk_len=1000, **kwargs):
         self.cluster_type = cluster_type
         self.cluster_line = cluster_line
         self.min_cluster_size = min_cluster_size
         self.mer_cos = mer_cos
+        self.chunk_len = chunk_len
+        self.min_chunk_len = min_chunk_len
         if self.cluster_type == 'spectral':
             self.cluster = SpectralCluster(**kwargs)
         elif self.cluster_type == 'umap_hdbscan':
@@ -219,17 +224,71 @@ class CommonClustering:
         if X.shape[0] < self.cluster_line:
             return np.ones(X.shape[0], dtype=int)
         # clustering
-        labels = self.cluster(X)
+        labels = self.chunk_clustering(X)
 
         # remove extremely minor cluster
-        labels = self.filter_minor_cluster(labels, X, self.min_cluster_size)
+        labels = self.filter_minor_cluster(labels, X)
         # merge similar  speaker
         if self.mer_cos is not None:
             labels = self.merge_by_cos(labels, X, self.mer_cos)
         
         return labels
     
-    def filter_minor_cluster(self, labels, x, min_cluster_size):
+    def chunk_clustering(self, embeddings):
+        if len(embeddings) <= self.chunk_len +  self.min_chunk_len:
+            return self.cluster(embeddings)
+        num_chunk = floor(len(embeddings) / self.chunk_len)
+        labels = None
+        label_offset = 0
+        sampled_embeddings_full = None
+        sampled_labels_full = None
+        for i in range(num_chunk-1):
+            current_labels = self.cluster(embeddings[i*self.chunk_len: (i+1)*self.chunk_len])
+            sampled_embeddings, sampled_labels, current_labels = sample_embeddings_labels(embeddings[i*self.chunk_len: (i+1)*self.chunk_len], current_labels, label_offset=label_offset)
+            if labels is None:
+                labels = current_labels
+                sampled_embeddings_full = sampled_embeddings
+                sampled_labels_full = sampled_labels
+            else:
+                labels = np.concatenate([labels, current_labels], axis=0)
+                sampled_embeddings_full = np.concatenate([sampled_embeddings_full, sampled_embeddings], axis=0)
+                sampled_labels_full = np.concatenate([sampled_labels_full, sampled_labels], axis=0)
+            label_offset = np.max(sampled_labels_full) + 1
+        if len(embeddings) - num_chunk*self.chunk_len < self.min_chunk_len:
+            current_labels = self.cluster(embeddings[(num_chunk-1)*self.chunk_len:])
+            sampled_embeddings, sampled_labels, current_labels = sample_embeddings_labels(embeddings[(num_chunk-1)*self.chunk_len:], current_labels, label_offset=label_offset)
+            if labels is None:
+                labels = current_labels
+                sampled_embeddings_full = sampled_embeddings
+                sampled_labels_full = sampled_labels
+            else:
+                labels = np.concatenate([labels, current_labels], axis=0)
+                sampled_embeddings_full = np.concatenate([sampled_embeddings_full, sampled_embeddings], axis=0)
+                sampled_labels_full = np.concatenate([sampled_labels_full, sampled_labels], axis=0)
+        else:
+            current_labels = self.cluster(embeddings[(num_chunk-1)*self.chunk_len: num_chunk*self.chunk_len])
+            sampled_embeddings, sampled_labels, current_labels = sample_embeddings_labels(embeddings[(num_chunk-1)*self.chunk_len: num_chunk*self.chunk_len], current_labels, label_offset=label_offset)
+            if labels is None:
+                labels = current_labels
+                sampled_embeddings_full = sampled_embeddings
+                sampled_labels_full = sampled_labels
+            else:
+                labels = np.concatenate([labels, current_labels], axis=0)
+                sampled_embeddings_full = np.concatenate([sampled_embeddings_full, sampled_embeddings], axis=0)
+                sampled_labels_full = np.concatenate([sampled_labels_full, sampled_labels], axis=0)
+            label_offset = np.max(sampled_labels_full) + 1
+            current_labels = self.cluster(embeddings[num_chunk*self.chunk_len:])
+            sampled_embeddings, sampled_labels, current_labels = sample_embeddings_labels(embeddings[num_chunk*self.chunk_len:], current_labels, label_offset=label_offset)
+            labels = np.concatenate([labels, current_labels], axis=0)
+            sampled_embeddings_full = np.concatenate([sampled_embeddings_full, sampled_embeddings], axis=0)
+            sampled_labels_full = np.concatenate([sampled_labels_full, sampled_labels], axis=0)
+
+        # len(embeddings)
+        new_sampled_labels_full = self.cluster(sampled_embeddings_full)
+        labels = reassign_labels(labels, sampled_labels_full, new_sampled_labels_full)
+        return labels
+    
+    def filter_minor_cluster(self, labels, x):
         cset = np.unique(labels)
         csize = np.array([(labels == i).sum() for i in cset])
         minor_idx = np.where(csize < self.min_cluster_size)[0]

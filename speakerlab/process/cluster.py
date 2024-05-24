@@ -25,20 +25,32 @@ class SpectralCluster:
     This implementation is adapted from https://github.com/speechbrain/speechbrain.
     """
 
-    def __init__(self, min_num_spks=1, max_num_spks=10, pval=0.02, min_pnum=6, oracle_num=None):
+    def __init__(self, min_num_spks=1, max_num_spks=10, prune_method="pval", pval=0.02, min_pnum=6, nval=10, scoreval=0.6, oracle_num=None):
         self.min_num_spks = min_num_spks
         self.max_num_spks = max_num_spks
+        if prune_method not in ["pval", "nval", "scoreval"]:
+            raise ValueError(
+                '%s is not currently supported. Either one of pval, nval, scoreval' % prune_method
+            )
+        self.prune_method = prune_method
         self.min_pnum = min_pnum
         self.pval = pval
+        self.nval = nval
+        self.scoreval = scoreval
         self.k = oracle_num
 
-    def __call__(self, X, pval=None, oracle_num=None):
+    def __call__(self, X, pval=None, nval=None, scoreval=None, oracle_num=None):
         # Similarity matrix computation
         sim_mat = self.get_sim_mat(X)
 
-        # Refining similarity matrix with pval
-        prunned_sim_mat = self.p_pruning(sim_mat, pval)
-
+        # Refining similarity matrix
+        if self.prune_method == "pval":
+            prunned_sim_mat = self.p_pruning(sim_mat, pval)
+        elif self.prune_method == "nval":
+            prunned_sim_mat = self.n_pruning(sim_mat, nval)
+        else:
+            prunned_sim_mat = self.score_pruning(sim_mat, scoreval)
+        
         # Symmetrization
         sym_prund_sim_mat = 0.5 * (prunned_sim_mat + prunned_sim_mat.T)
 
@@ -58,7 +70,34 @@ class SpectralCluster:
         M = cosine_similarity(X, X)
         return M
 
+    def n_pruning(self, A, nval=None):
+        """keep only n samples in the pruned matrix
+        """
+        if nval is None:
+            nval = self.nval
+        tot_elems = A.shape[0]
+        n_elems = max(tot_elems-nval, int(0.8*tot_elems))
+
+        # For each row in a affinity matrix
+        for i in range(tot_elems):
+            low_indexes = np.argsort(A[i, :])
+            low_indexes = low_indexes[0:n_elems]
+
+            # Replace smaller similarity values by 0s
+            A[i, low_indexes] = 0
+        return A
+    
+    def score_pruning(self, A, scoreval=None):
+        """Keep those above score in pruned matrix
+        """
+        if scoreval is None:
+            scoreval = self.scoreval
+        A[A<scoreval]=0
+        return A
+
     def p_pruning(self, A, pval=None):
+        """keep only p portion
+        """
         if pval is None:
             pval = self.pval
         n_elems = int((1 - pval) * A.shape[0])

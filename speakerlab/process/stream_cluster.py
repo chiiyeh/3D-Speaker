@@ -24,9 +24,9 @@ class SequentialCluster:
         self.emb_dim = emb_dim
         max_speaker_allocation = max(100, 2*max_num_spks)
         self.cluster_details = {
-            "avaliable_speakers": list(range(max_speaker_allocation)),
-            "spk_counts": np.zeros((max_speaker_allocation, 1)),
-            "spk_last_index": np.zeros((max_speaker_allocation, 1)),
+            "available_speakers": list(range(max_speaker_allocation)),
+            "spk_counts": np.zeros((max_speaker_allocation)),
+            "spk_last_index": np.zeros((max_speaker_allocation)),
             "spk_embeddings": np.zeros((max_speaker_allocation, emb_dim)),
             "labels": [],
         }
@@ -36,7 +36,7 @@ class SequentialCluster:
         for idx, embedding in enumerate(X):
             idx += idx_offset
             if not self.cluster_details['labels']:
-                label =  self.cluster_details['avaliable_speakers'].pop(0)
+                label =  self.cluster_details['available_speakers'].pop(0)
                 self.cluster_details['spk_embeddings'][label] = embedding
                 self.cluster_details['spk_last_index'][label] = idx
                 self.cluster_details['spk_counts'][label] += 1
@@ -57,6 +57,7 @@ class SequentialCluster:
                         speakers_merge = final_speakers_merge
                     if len(speakers_merge) == 1:
                         label = speakers_merge[0]
+                        old_spk_counts = self.cluster_details['spk_counts'][label]
                         self.cluster_details['spk_embeddings'][label] = (self.cluster_details['spk_counts'][label] * self.cluster_details['spk_embeddings'][label] + embedding)/(self.cluster_details['spk_counts'][label]+1)
                         self.cluster_details['spk_counts'][label] += 1
                         self.cluster_details['spk_last_index'][label] = idx
@@ -66,7 +67,7 @@ class SequentialCluster:
                         ## Not merging if gap exceeds threshold
                         label, speakers_merge = self.keep_label(speakers_merge)
                         speakers_merge = [lab for lab in speakers_merge if idx-self.get_first_idx(lab) <= self.no_merge_gap]
-
+                        old_spk_counts = self.cluster_details['spk_counts'][label]
                         if speakers_merge:
                             merged_embedding, tot_count = self.get_merged_embedding_and_counts(speakers_merge + [label], embedding)
                             self.cluster_details['spk_embeddings'][label] = merged_embedding
@@ -75,8 +76,13 @@ class SequentialCluster:
                             for lab in speakers_merge:
                                 self.remove_speaker(lab)
                                 _ = self.replace_speaker(label, lab)
+                    if old_spk_counts < self.min_cluster_size and self.cluster_details['spk_counts'][label] >= self.min_cluster_size:
+                        new_label = self.cluster_details['available_speakers'].pop(0)
+                        self.switch_speaker(new_label, label)
+                        label = new_label
                 else:
-                    label = self.cluster_details['avaliable_speakers'].pop(0)
+                    #New speaker is assigned end numbers, once pass min_cluster_size will be reassigned a new number
+                    label = self.cluster_details['available_speakers'].pop(-1)
                     self.cluster_details['spk_embeddings'][label] = embedding
                     self.cluster_details['spk_counts'][label] += 1
                     self.cluster_details['spk_last_index'][label] = idx
@@ -85,7 +91,7 @@ class SequentialCluster:
             if idx > 20:
                 self.filter_minor_cluster_inter(self.merge_delay)
                 self.merge_speaker_embeddings()
-        return 
+        return
     
     def merge_speaker_embeddings(self):
         skip_merge = []
@@ -111,12 +117,17 @@ class SequentialCluster:
                 tot_count += self.cluster_details['spk_counts'][lab]
                 merged_embedding += self.cluster_details['spk_counts'][lab] * self.cluster_details['spk_embeddings'][lab]
             label, speakers_merge = self.keep_label(speakers_merge)
+            old_spk_counts = self.cluster_details['spk_counts'][label]
             self.cluster_details['spk_embeddings'][label] = merged_embedding / tot_count
             self.cluster_details['spk_counts'][label] = tot_count
             self.cluster_details['spk_last_index'][label] = max(
-                self.cluster_details['spk_last_index'][label], 
+                self.cluster_details['spk_last_index'][label],
                 self.cluster_details['spk_last_index'][speakers_merge[0]]
                 )
+            if old_spk_counts < self.min_cluster_size and self.cluster_details['spk_counts'][label] >= self.min_cluster_size:
+                new_label = self.cluster_details['available_speakers'].pop(0)
+                self.switch_speaker(new_label, label)
+                label = new_label
             for lab in speakers_merge:
                 self.remove_speaker(lab)
                 first_idx = self.replace_speaker(label, lab)
@@ -157,11 +168,19 @@ class SequentialCluster:
                 self.cluster_details['labels'][lab_idx] = speaker
         return first_idx
     
+    def switch_speaker(self, speaker, old_speaker):
+        self.cluster_details['spk_embeddings'][speaker] = self.cluster_details['spk_embeddings'][old_speaker]
+        self.cluster_details['spk_counts'][speaker] = self.cluster_details['spk_counts'][old_speaker]
+        self.cluster_details['spk_last_index'][speaker] = self.cluster_details['spk_last_index'][old_speaker]
+        first_idx = self.replace_speaker(speaker, old_speaker)
+        self.remove_speaker(old_speaker)
+        return first_idx
+    
     def remove_speaker(self, old_speaker):
         self.cluster_details['spk_embeddings'][old_speaker] = np.zeros(self.emb_dim)
         self.cluster_details['spk_last_index'][old_speaker] = 0
         self.cluster_details['spk_counts'][old_speaker] = 0
-        self.cluster_details['avaliable_speakers'].insert(0, old_speaker)
+        self.cluster_details['available_speakers'].insert(len(self.cluster_details['available_speakers']), old_speaker)
         return 
     
     def filter_minor_cluster_inter(self, merge_delay):
@@ -191,7 +210,6 @@ class SequentialCluster:
             speaker = cos_sim.argmax()
             self.replace_speaker(speaker, i)
             self.remove_speaker(i)
-        
         return
 
 class CommonStreamClustering:
